@@ -30,6 +30,7 @@ enum RecognizerError: Error {
 }
 
 actor ExpoSpeechRecognizer: ObservableObject {
+  private var laylaSession: LaylaSpeechSession?
   private var options: SpeechRecognitionOptions?
   private var audioEngine: AVAudioEngine?
   private var request: SFSpeechRecognitionRequest?
@@ -133,47 +134,49 @@ actor ExpoSpeechRecognizer: ObservableObject {
     speechStartHandler: @escaping (() -> Void),
     audioStartHandler: @escaping (String?, Double) -> Void,
     audioEndHandler: @escaping (String?, Double) -> Void,
-    volumeChangeHandler: @escaping (Float) -> Void
-  ) {
+    volumeChangeHandler: @escaping (Float) -> Void,
+    laylaEventHandler: @escaping (String, [String: Any]?) -> Void,
+    shouldStart: @escaping () -> Bool
+  ) async {
+    guard shouldStart() else { return }
     self.endHandler = endHandler
     self.audioEndHandler = audioEndHandler
     self.volumeChangeHandler = volumeChangeHandler
     self.errorHandler = errorHandler
-    Task {
-      await startRecognizer(
-        options: options,
-        resultHandler: resultHandler,
-        errorHandler: errorHandler,
-        startHandler: startHandler,
-        speechStartHandler: speechStartHandler,
-        audioStartHandler: audioStartHandler
-      )
-    }
+    await startRecognizer(
+      options: options,
+      resultHandler: resultHandler,
+      errorHandler: errorHandler,
+      startHandler: startHandler,
+      speechStartHandler: speechStartHandler,
+      audioStartHandler: audioStartHandler,
+      laylaEventHandler: laylaEventHandler,
+      shouldStart: shouldStart
+    )
   }
 
   /// Stops the speech recognizer.
   /// Attempts to emit a final result if the speech recognizer is still running.
-  @MainActor func stop() {
-    Task {
-      let taskState = await task?.state
-      // Check if the recognizer is running
-      // If it is, then just run the stopListening function
-      if taskState == .running || taskState == .starting {
-        await stopListening()
-      } else {
-        // Task isn't likely running, just reset and emit an end event
-        await reset(andEmitEnd: true)
-      }
+  func stop(shouldStop: () -> Bool = { true }) {
+    guard shouldStop() else { return }
+    if let session = laylaSession {
+      session.stop()
+      return
+    }
+    let taskState = task?.state
+    if taskState == .running || taskState == .starting {
+      stopListening()
+    } else {
+      reset(andEmitEnd: true)
     }
   }
 
   /// Cancels the current speech recognition task.
   /// This is different from `stop` in that the recognition task is immediately cancelled and no
   /// final result is emitted.
-  @MainActor func abort() {
-    Task {
-      await reset(andEmitEnd: true)
-    }
+  func abort(shouldStop: () -> Bool = { true }) {
+    guard shouldStop() else { return }
+    reset(andEmitEnd: true)
   }
 
   ///
@@ -184,6 +187,7 @@ actor ExpoSpeechRecognizer: ObservableObject {
   ///  | "recognizing"
   ///  | "stopping";
   func getState() -> String {
+    if let laylaSession { return laylaSession.getState() }
     switch task?.state {
     case .none:
       return "inactive"
@@ -205,8 +209,11 @@ actor ExpoSpeechRecognizer: ObservableObject {
     errorHandler: @escaping (Error) -> Void,
     startHandler: @escaping () -> Void,
     speechStartHandler: @escaping () -> Void,
-    audioStartHandler: @escaping (String?, Double) -> Void
+    audioStartHandler: @escaping (String?, Double) -> Void,
+    laylaEventHandler: @escaping (String, [String: Any]?) -> Void,
+    shouldStart: () -> Bool
   ) {
+    guard shouldStart() else { return }
     // Reset the speech recognizer before starting
     reset(andEmitEnd: false)
 
@@ -222,6 +229,15 @@ actor ExpoSpeechRecognizer: ObservableObject {
     }
 
     do {
+      guard options.microphoneSource == "system" || options.microphoneSource == "layla-audio" else {
+        throw RecognizerError.invalidAudioSource
+      }
+      if options.microphoneSource == "layla-audio" {
+        let session = LaylaSpeechSession(emit: laylaEventHandler)
+        laylaSession = session
+        session.start(options: options, recognizer: recognizer)
+        return
+      }
       let request = Self.prepareRequest(
         options: options,
         recognizer: recognizer
@@ -525,6 +541,11 @@ actor ExpoSpeechRecognizer: ObservableObject {
 
   /// Reset the speech recognizer.
   private func reset(andEmitEnd: Bool = false) {
+    if let session = laylaSession {
+      laylaSession = nil
+      session.abort()
+      return
+    }
     let taskWasRunning = task != nil
     let shouldEmitEndEvent = andEmitEnd || taskWasRunning || stoppedListening
 

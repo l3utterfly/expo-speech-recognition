@@ -9,6 +9,9 @@ import expo.modules.kotlin.types.OptimizedRecord
 @OptimizedRecord
 class SpeechRecognitionOptions : Record {
     @Field
+    val microphoneSource: String = "system"
+
+    @Field
     val interimResults: Boolean? = false
 
     @Field

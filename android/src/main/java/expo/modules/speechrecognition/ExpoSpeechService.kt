@@ -19,6 +19,7 @@ import android.util.Log
 import java.io.File
 import java.net.URI
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 data class SpeechRecognitionErrorEvent(
     val error: String,
@@ -49,12 +50,16 @@ class ExpoSpeechService(
 ) : RecognitionListener {
     private var speech: SpeechRecognizer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val commandID = AtomicLong()
+    private val sessionID = AtomicLong()
+    private var activeSessionID = 0L
 
     private lateinit var options: SpeechRecognitionOptions
     private var lastVolumeChangeEventTime: Long = 0L
 
     /** Audio recorder for persisting audio */
     private var audioRecorder: ExpoAudioRecorder? = null
+    private var laylaInput: LaylaAudioInput? = null
 
     /** File streamer for file-based recognition */
     private var delayedFileStreamer: DelayedFileStreamer? = null
@@ -114,14 +119,20 @@ class ExpoSpeechService(
 
     /** Starts speech recognition */
     fun start(options: SpeechRecognitionOptions) {
-        this.options = options
+        val command = commandID.incrementAndGet()
+        val session = sessionID.incrementAndGet()
         mainHandler.post {
+            if (command != commandID.get()) return@post
+            this.options = options
+            activeSessionID = session
             log("Start recognition.")
 
             // Destroy any previous SpeechRecognizer / audio recorder
             speech?.destroy()
             audioRecorder?.stop()
             audioRecorder = null
+            laylaInput?.stop()
+            laylaInput = null
             delayedFileStreamer?.close()
             delayedFileStreamer = null
             lastDetectedLanguage = null
@@ -141,15 +152,17 @@ class ExpoSpeechService(
                     }
 
                 // Start listening
-                speech?.setRecognitionListener(this)
+                speech?.setRecognitionListener(GuardedRecognitionListener(this) { session == sessionID.get() })
                 speech?.startListening(intent)
+
+                laylaInput?.start()
 
                 delayedFileStreamer?.startStreaming()
 
                 sendEvent(
                     "audiostart",
                     mapOf(
-                        "uri" to audioRecorder?.outputFileUri,
+                        "uri" to (laylaInput?.outputFileUri ?: audioRecorder?.outputFileUri),
                         "timestamp" to (recorderStartedAtMillis ?: System.currentTimeMillis()),
                     ),
                 )
@@ -173,9 +186,11 @@ class ExpoSpeechService(
      */
     private fun stopRecording() {
         audioRecorder?.stop()
+        laylaInput?.stop()
         val timestamp = audioRecorder?.stoppedAtMillis ?: System.currentTimeMillis()
-        if (audioRecorder?.outputFile != null) {
-            val uri = audioRecorder?.outputFile?.absolutePath?.let { "file://$it" }
+        val outputFile = laylaInput?.outputFile ?: audioRecorder?.outputFile
+        if (outputFile != null) {
+            val uri = outputFile.absolutePath.let { "file://$it" }
             sendEvent(
                 "audioend",
                 mapOf(
@@ -193,6 +208,7 @@ class ExpoSpeechService(
             )
         }
         audioRecorder = null
+        laylaInput = null
     }
 
     /**
@@ -200,13 +216,26 @@ class ExpoSpeechService(
      * Attempts to emit a final result if the speech recognizer is still running.
      */
     fun stop() {
+        val command = commandID.incrementAndGet() // a stop before a queued start must not open capture
         mainHandler.post {
+            if (command != commandID.get()) return@post
+            if (speech == null || activeSessionID != sessionID.get()) {
+                teardownAndEnd()
+                return@post
+            }
             recognitionState = RecognitionState.STOPPING
+            laylaInput?.finish()
             try {
                 speech?.stopListening()
             } catch (e: Exception) {
                 // do nothing
             }
+            // Some recognition services never acknowledge EOF/stopListening.
+            mainHandler.postDelayed({
+                if (command == commandID.get() && recognitionState == RecognitionState.STOPPING) {
+                    teardownAndEnd()
+                }
+            }, 2000)
         }
         // Wait for the onResults() / onError() handlers to be called
         // This is to ensure that the final result is emitted and the end event is sent
@@ -218,6 +247,7 @@ class ExpoSpeechService(
      * final result is emitted.
      */
     fun abort() {
+        sessionID.incrementAndGet()
         teardownAndEnd()
     }
 
@@ -234,14 +264,18 @@ class ExpoSpeechService(
      * Stops speech recognition, recording and updates state
      */
     private fun teardownAndEnd(state: RecognitionState = RecognitionState.INACTIVE) {
+        val command = commandID.incrementAndGet()
+        sessionID.incrementAndGet()
         recognitionState = RecognitionState.STOPPING
         mainHandler.post {
+            if (command != commandID.get()) return@post
             try {
                 speech?.cancel()
             } catch (e: Exception) {
                 // do nothing
             }
             speech?.destroy()
+            speech = null
             stopRecording()
             soundState = SoundState.INACTIVE
             sendEvent("end", null)
@@ -252,6 +286,16 @@ class ExpoSpeechService(
     }
 
     private fun createSpeechIntent(options: SpeechRecognitionOptions): Intent {
+        require(options.microphoneSource in listOf("system", "layla-audio")) { "Unknown microphoneSource" }
+        if (options.microphoneSource == "layla-audio") {
+            require(Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                "Layla microphone recognition requires Android 13 or newer"
+            }
+            require(options.audioSource == null) { "microphoneSource cannot be combined with audioSource" }
+            require(options.androidIntentOptions?.keys?.any {
+                it.startsWith("EXTRA_AUDIO_SOURCE") || it == "EXTRA_SEGMENTED_SESSION"
+            } != true) { "Cannot override the Layla microphone pipe or segmented session" }
+        }
         val action = options.androidIntent ?: RecognizerIntent.ACTION_RECOGNIZE_SPEECH
         val intent = Intent(action)
 
@@ -277,7 +321,33 @@ class ExpoSpeechService(
         }
 
         // Set up audio recording & sink to recognizer/file
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && options.audioSource == null) {
+        if (options.microphoneSource == "layla-audio") {
+            lateinit var input: LaylaAudioInput
+            input = LaylaAudioInput(
+                reactContext,
+                options.recordingOptions?.takeIf { it.persist }?.let { resolveFilePathFromConfig(it) },
+            ) { error ->
+                mainHandler.post {
+                    if (laylaInput === input && recognitionState != RecognitionState.STOPPING) {
+                        sendEvent("error", mapOf("error" to "audio-capture", "message" to error.message, "code" to -1))
+                        teardownAndEnd(RecognitionState.ERROR)
+                    }
+                }
+            }
+            laylaInput = input
+            intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, input.parcel)
+            intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+            intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+            intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16000)
+            intent.putExtra(
+                RecognizerIntent.EXTRA_SEGMENTED_SESSION,
+                if (options.continuous == true) RecognizerIntent.EXTRA_AUDIO_SOURCE
+                else RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
+            )
+            if (options.continuous != true) {
+                intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500)
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && options.audioSource == null) {
             // Feature: Stream microphone input to SpeechRecognition so the user can access the audio blob
             if (options.recordingOptions?.persist == true) {
                 audioRecorder = ExpoAudioRecorder(reactContext, resolveFilePathFromConfig(options.recordingOptions))
@@ -464,7 +534,7 @@ class ExpoSpeechService(
     override fun onReadyForSpeech(params: Bundle?) {
         // Avoid sending this event if there was an error
         // An error may preempt this event in the case of a permission error or a language not supported error
-        if (recognitionState != RecognitionState.ERROR) {
+        if (recognitionState == RecognitionState.STARTING) {
             sendEvent("start", null)
             recognitionState = RecognitionState.ACTIVE
         }
@@ -525,6 +595,9 @@ class ExpoSpeechService(
     }
 
     override fun onError(error: Int) {
+        if ((error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) &&
+            renewLegacyContinuous()
+        ) return
         val errorInfo = getErrorInfo(error)
         // Web Speech API:
         // https://developer.mozilla.org/en-US/docs/Web/API/SpeechRecognition/nomatch_event
@@ -625,7 +698,25 @@ class ExpoSpeechService(
         }
         log("onResults(), results: $resultsList")
 
-        teardownAndEnd()
+        if (!renewLegacyContinuous()) teardownAndEnd()
+    }
+
+    /** Older Android services end after each utterance; renew inside native lifecycle guards. */
+    private fun renewLegacyContinuous(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU || options.continuous != true ||
+            options.audioSource != null || recognitionState == RecognitionState.STOPPING ||
+            recognitionState == RecognitionState.ERROR || activeSessionID != sessionID.get()
+        ) return false
+        val command = commandID.get()
+        val session = sessionID.incrementAndGet()
+        activeSessionID = session
+        speech?.destroy()
+        speech = null
+        recognitionState = RecognitionState.STARTING
+        mainHandler.postDelayed({
+            if (command == commandID.get() && session == sessionID.get()) start(options)
+        }, 250)
+        return true
     }
 
     override fun onPartialResults(partialResults: Bundle?) {

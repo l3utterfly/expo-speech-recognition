@@ -3,6 +3,9 @@ import Speech
 
 struct SpeechRecognitionOptions: Record {
   @Field
+  var microphoneSource: String = "system"
+
+  @Field
   var interimResults: Bool = false
 
   @Field

@@ -196,9 +196,17 @@ export type ExpoSpeechRecognitionNativeEventMap = {
 };
 
 export type ExpoSpeechRecognitionOptions = {
+  /**
+   * Microphone owner. `layla-audio` consumes native 16 kHz mono frames, sharing
+   * capture with VAD and using call-mode echo cancellation during a Layla call.
+   * Requires Android 13+ and a recognizer that accepts EXTRA_AUDIO_SOURCE, or iOS.
+   * Cannot be combined with audioSource. iOS continuous sessions renew native
+   * recognition tasks without reopening the mic or emitting end between tasks.
+   */
+  microphoneSource?: "system" | "layla-audio";
   /** [Default: "en-US"] The language of the speech recognition */
   lang?: string;
-  /** [Default: false] Note for iOS: final results are only available after speech recognition has stopped */
+  /** [Default: false] Emit partial results. The Layla microphone also emits utterance finals while continuously listening. */
   interimResults?: boolean;
   /** [Default: 5] The maximum number of alternative transcriptions to return. */
   maxAlternatives?: number;
@@ -213,7 +221,9 @@ export type ExpoSpeechRecognitionOptions = {
   /**
    * [Default: false] Continuous recognition.
    *
-   * Not supported on Android 12 and below.
+   * Android 12 and below renew system microphone sessions natively between utterances.
+   * With the Layla microphone, iOS keeps capture open and renews Apple tasks as needed;
+   * Android 13+ uses a segmented audio-source session (service support required).
    *
    * If false, the behaviors are the following:
    *

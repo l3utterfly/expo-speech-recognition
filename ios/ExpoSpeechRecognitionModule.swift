@@ -41,6 +41,21 @@ private func legacyResolveBlock(for promise: Promise) -> EXPromiseResolveBlock {
 public class ExpoSpeechRecognitionModule: Module {
 
   var speechRecognizer: ExpoSpeechRecognizer?
+  private let commandLock = NSLock()
+  private var commandID = 0
+
+  private func nextCommand() -> Int {
+    commandLock.lock()
+    defer { commandLock.unlock() }
+    commandID += 1
+    return commandID
+  }
+
+  private func isCurrentCommand(_ value: Int) -> Bool {
+    commandLock.lock()
+    defer { commandLock.unlock() }
+    return commandID == value
+  }
 
   // Hack for iOS 18 to detect final results
   // See: https://forums.developer.apple.com/forums/thread/762952 for more info
@@ -62,6 +77,7 @@ public class ExpoSpeechRecognitionModule: Module {
     Name("ExpoSpeechRecognition")
 
     OnDestroy {
+      _ = nextCommand()
       // Cancel any running speech recognizers
       Task {
         await speechRecognizer?.abort()
@@ -178,9 +194,11 @@ public class ExpoSpeechRecognitionModule: Module {
 
     /** Start recognition with args: lang, interimResults, maxAlternatives */
     Function("start") { (options: SpeechRecognitionOptions) in
+      let command = nextCommand()
       Task {
         do {
           let currentLocale = await speechRecognizer?.getLocale()
+          guard isCurrentCommand(command) else { return }
 
           // Reset the previous result
           self.previousResult = nil
@@ -199,13 +217,19 @@ public class ExpoSpeechRecognitionModule: Module {
               return
             }
 
-            self.speechRecognizer = try await ExpoSpeechRecognizer(
+            await self.speechRecognizer?.abort(shouldStop: { self.isCurrentCommand(command) })
+            guard isCurrentCommand(command) else { return }
+            let nextRecognizer = try await ExpoSpeechRecognizer(
               locale: locale
             )
+            guard isCurrentCommand(command) else { return }
+            self.speechRecognizer = nextRecognizer
           }
 
           if !options.requiresOnDeviceRecognition {
-            guard await SFSpeechRecognizer.hasAuthorizationToRecognize() else {
+            let authorized = await SFSpeechRecognizer.hasAuthorizationToRecognize()
+            guard isCurrentCommand(command) else { return }
+            guard authorized else {
               sendErrorAndStop(
                 error: "not-allowed",
                 message: RecognizerError.notAuthorizedToRecognize.message
@@ -214,13 +238,18 @@ public class ExpoSpeechRecognitionModule: Module {
             }
           }
 
-          guard await AVAudioSession.sharedInstance().hasPermissionToRecord() else {
+          guard isCurrentCommand(command) else { return }
+
+          let permitted = await AVAudioSession.sharedInstance().hasPermissionToRecord()
+          guard isCurrentCommand(command) else { return }
+          guard permitted else {
             sendErrorAndStop(
               error: "not-allowed",
               message: RecognizerError.notPermittedToRecord.message
             )
             return
           }
+          guard isCurrentCommand(command) else { return }
 
           // Start recognition!
           await speechRecognizer?.start(
@@ -258,9 +287,16 @@ public class ExpoSpeechRecognitionModule: Module {
             },
             volumeChangeHandler: { [weak self] value in
               self?.sendEvent("volumechange", ["value": value])
+            },
+            laylaEventHandler: { [weak self] name, body in
+              self?.sendEvent(name, body ?? [:])
+            },
+            shouldStart: { [weak self] in
+              self?.isCurrentCommand(command) ?? false
             }
           )
         } catch {
+          guard isCurrentCommand(command) else { return }
           self.sendEvent(
             "error",
             [
@@ -364,9 +400,11 @@ public class ExpoSpeechRecognitionModule: Module {
     }
 
     Function("stop") { () -> Void in
+      let command = nextCommand()
       Task {
+        guard isCurrentCommand(command) else { return }
         if let recognizer = speechRecognizer {
-          await recognizer.stop()
+          await recognizer.stop(shouldStop: { self.isCurrentCommand(command) })
         } else {
           sendEvent("end")
         }
@@ -374,11 +412,13 @@ public class ExpoSpeechRecognitionModule: Module {
     }
 
     Function("abort") { () -> Void in
+      let command = nextCommand()
       Task {
+        guard isCurrentCommand(command) else { return }
         sendEvent("error", ["error": "aborted", "message": "Speech recognition aborted."])
 
         if let recognizer = speechRecognizer {
-          await recognizer.abort()
+          await recognizer.abort(shouldStop: { self.isCurrentCommand(command) })
         } else {
           sendEvent("end")
         }
