@@ -8,30 +8,25 @@ import android.system.Os
 import android.system.OsConstants
 import expo.modules.laylaaudio.LaylaAudioEngine
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 /** Native fan-out consumer. Pipe backpressure never blocks Layla's capture/VAD thread. */
 internal class LaylaAudioInput(
     private val context: Context,
-    private val outputPath: String?,
-    private val onFailure: (Exception) -> Unit,
+    outputPath: String?,
+    onFailure: (Exception) -> Unit,
 ) {
     private val pipe = ParcelFileDescriptor.createPipe()
     val parcel: ParcelFileDescriptor = pipe[0]
     private val writer = pipe[1]
-    private val frames = ArrayBlockingQueue<FloatArray>(100) // about two seconds
-    private val running = AtomicBoolean(false)
-    private val accepting = AtomicBoolean(false)
-    private val failed = AtomicBoolean(false)
+    private val pump = LaylaRecordingPump(
+        context.cacheDir,
+        outputPath,
+        ::writeFully,
+        { runCatching { writer.close() } },
+        onFailure,
+    )
     private var subscription: AutoCloseable? = null
-    private var worker: Thread? = null
-    @Volatile var outputFile: File? = null
-        private set
     val outputFileUri: String? = outputPath?.let { "file://$it" }
 
     init {
@@ -49,70 +44,44 @@ internal class LaylaAudioInput(
 
     fun start() {
         LaylaAudioEngine.initialize(context)
-        running.set(true)
-        accepting.set(true)
-        worker = thread(name = "LaylaRecognitionPipe") { pump() }
+        pump.start()
         try {
             subscription = LaylaAudioEngine.addMicConsumer { samples, rate ->
-                if (accepting.get()) {
-                    if (rate != 16000 || !frames.offer(samples)) {
-                        fail(IOException("Speech recognizer is not consuming Layla microphone audio"))
-                    }
+                if (rate != 16000) {
+                    pump.fail(IOException("Layla microphone audio is not 16 kHz"))
+                } else if (!pump.offer(samples)) {
+                    pump.fail(IOException("Speech recognizer is not consuming Layla microphone audio"))
                 }
             }
         } catch (error: Exception) {
-            stop()
+            close(keepRecording = false) {}
             throw error
         }
     }
 
-    /** Drain queued PCM and close the write end: segmented recognition finishes at EOF. */
+    /** Ends capture; queued PCM still drains, then the recognizer sees EOF (segmented sessions finish there). */
     fun finish() {
-        accepting.set(false)
+        pump.finishInput()
         subscription?.close()
         subscription = null
     }
 
-    fun stop() {
+    /**
+     * Ends capture and the recognizer feed, then finishes the recording off the caller's thread.
+     * [onClosed] gets the complete WAV (null without one, or when [keepRecording] is false).
+     */
+    fun close(keepRecording: Boolean, onClosed: (File?) -> Unit) {
         finish()
-        running.set(false)
-        worker?.join(1000)
-        runCatching { writer.close() }
-        runCatching { parcel.close() }
-        worker = null
-        frames.clear()
-    }
-
-    private fun pump() {
-        var pcmFile: File? = null
-        try {
-            pcmFile = outputPath?.let { File.createTempFile("layla-recognition-", ".pcm", context.cacheDir) }
-            val fileStream = pcmFile?.let { FileOutputStream(it) }
-            try {
-                while (running.get() && (accepting.get() || frames.isNotEmpty())) {
-                    val samples = frames.poll(100, TimeUnit.MILLISECONDS) ?: continue
-                    val bytes = laylaPcm16(samples)
-                    writeFully(bytes)
-                    fileStream?.write(bytes)
-                }
-            } finally {
-                fileStream?.close()
-            }
-            if (outputPath != null && pcmFile != null) {
-                outputFile = ExpoAudioRecorder.appendWavHeader(outputPath, pcmFile, 16000)
-            }
-        } catch (error: Exception) {
-            if (running.get()) fail(error)
-        } finally {
-            runCatching { writer.close() }
-            pcmFile?.delete()
+        pump.close(keepRecording) { file ->
+            runCatching { parcel.close() }
+            onClosed(file)
         }
     }
 
     private fun writeFully(bytes: ByteArray) {
         var offset = 0
         var lastProgress = SystemClock.elapsedRealtime()
-        while (offset < bytes.size && running.get()) {
+        while (offset < bytes.size) {
             try {
                 val written = Os.write(writer.fileDescriptor, bytes, offset, bytes.size - offset)
                 if (written > 0) {
@@ -120,19 +89,15 @@ internal class LaylaAudioInput(
                     lastProgress = SystemClock.elapsedRealtime()
                 }
             } catch (error: ErrnoException) {
-                if (error.errno != OsConstants.EAGAIN) throw error
-                if (SystemClock.elapsedRealtime() - lastProgress > 2000) {
+                if (error.errno != OsConstants.EAGAIN) throw IOException("Speech recognizer audio pipe closed", error)
+                // Once stopped, a recognizer may stop reading for good: give up on it quickly so the
+                // recording is not held back.
+                val limit = if (pump.stopping) 250 else 2000
+                if (SystemClock.elapsedRealtime() - lastProgress > limit) {
                     throw IOException("Speech recognizer did not read the supplied audio pipe", error)
                 }
                 Thread.sleep(5)
             }
-        }
-    }
-
-    private fun fail(error: Exception) {
-        if (failed.compareAndSet(false, true)) {
-            accepting.set(false)
-            onFailure(error)
         }
     }
 }

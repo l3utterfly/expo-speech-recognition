@@ -61,6 +61,10 @@ class ExpoSpeechService(
     private var audioRecorder: ExpoAudioRecorder? = null
     private var laylaInput: LaylaAudioInput? = null
 
+    /** Main-thread state: a stopped session's recording is still being finished. */
+    private var recordingClosing = false
+    private val afterRecording = ArrayList<() -> Unit>()
+
     /** File streamer for file-based recognition */
     private var delayedFileStreamer: DelayedFileStreamer? = null
     private var soundState = SoundState.INACTIVE
@@ -122,93 +126,120 @@ class ExpoSpeechService(
         val command = commandID.incrementAndGet()
         val session = sessionID.incrementAndGet()
         mainHandler.post {
-            if (command != commandID.get()) return@post
-            this.options = options
-            activeSessionID = session
-            log("Start recognition.")
+            // A session still finishing its recording ends (audioend, end) before the next starts.
+            afterRecordingClosed {
+                if (command != commandID.get()) return@afterRecordingClosed
+                this.options = options
+                activeSessionID = session
+                log("Start recognition.")
 
-            // Destroy any previous SpeechRecognizer / audio recorder
-            speech?.destroy()
-            audioRecorder?.stop()
-            audioRecorder = null
-            laylaInput?.stop()
-            laylaInput = null
-            delayedFileStreamer?.close()
-            delayedFileStreamer = null
-            lastDetectedLanguage = null
-            lastLanguageConfidence = null
-            recognitionState = RecognitionState.STARTING
-            soundState = SoundState.INACTIVE
-            lastVolumeChangeEventTime = 0L
-            try {
-                val intent = createSpeechIntent(options)
-                speech = createSpeechRecognizer(options)
+                // Destroy any previous SpeechRecognizer / audio recorder
+                speech?.destroy()
+                audioRecorder?.stop()
+                audioRecorder = null
+                // A replaced session sends no audioend, so its recording is discarded.
+                laylaInput?.close(keepRecording = false) {}
+                laylaInput = null
+                delayedFileStreamer?.close()
+                delayedFileStreamer = null
+                lastDetectedLanguage = null
+                lastLanguageConfidence = null
+                recognitionState = RecognitionState.STARTING
+                soundState = SoundState.INACTIVE
+                lastVolumeChangeEventTime = 0L
+                try {
+                    val intent = createSpeechIntent(options)
+                    speech = createSpeechRecognizer(options)
 
-                // Start the audio recorder
-                val recorderStartedAtMillis =
-                    audioRecorder?.let {
-                        it.start()
-                        System.currentTimeMillis()
-                    }
+                    // Start the audio recorder
+                    val recorderStartedAtMillis =
+                        audioRecorder?.let {
+                            it.start()
+                            System.currentTimeMillis()
+                        }
 
-                // Start listening
-                speech?.setRecognitionListener(GuardedRecognitionListener(this) { session == sessionID.get() })
-                speech?.startListening(intent)
+                    // Start listening
+                    speech?.setRecognitionListener(GuardedRecognitionListener(this) { session == sessionID.get() })
+                    speech?.startListening(intent)
 
-                laylaInput?.start()
+                    laylaInput?.start()
 
-                delayedFileStreamer?.startStreaming()
+                    delayedFileStreamer?.startStreaming()
 
-                sendEvent(
-                    "audiostart",
-                    mapOf(
-                        "uri" to (laylaInput?.outputFileUri ?: audioRecorder?.outputFileUri),
-                        "timestamp" to (recorderStartedAtMillis ?: System.currentTimeMillis()),
-                    ),
-                )
-            } catch (e: Exception) {
-                val errorMessage =
-                    when {
-                        e.localizedMessage != null -> e.localizedMessage
-                        e.message != null -> e.message
-                        else -> "Unknown error"
-                    }
-                e.printStackTrace()
-                log("Failed to create Speech Recognizer with error: $errorMessage")
-                sendEvent("error", mapOf("error" to "audio-capture", "message" to errorMessage, "code" to -1))
-                teardownAndEnd()
+                    sendEvent(
+                        "audiostart",
+                        mapOf(
+                            "uri" to (laylaInput?.outputFileUri ?: audioRecorder?.outputFileUri),
+                            "timestamp" to (recorderStartedAtMillis ?: System.currentTimeMillis()),
+                        ),
+                    )
+                } catch (e: Exception) {
+                    val errorMessage =
+                        when {
+                            e.localizedMessage != null -> e.localizedMessage
+                            e.message != null -> e.message
+                            else -> "Unknown error"
+                        }
+                    e.printStackTrace()
+                    log("Failed to create Speech Recognizer with error: $errorMessage")
+                    sendEvent("error", mapOf("error" to "audio-capture", "message" to errorMessage, "code" to -1))
+                    teardownAndEnd()
+                }
             }
         }
     }
 
     /**
-     * Stops the audio recorder and sends the recorded audio file path to the app.
+     * Stops the audio recorder and sends the recorded audio file path to the app, then runs
+     * [onStopped] on the main thread. A Layla recording is finished off the main thread: its
+     * audioend carries the uri only once the WAV is complete, and nothing else in the session
+     * lifecycle runs until then.
      */
-    private fun stopRecording() {
+    private fun stopRecording(onStopped: () -> Unit) {
         audioRecorder?.stop()
-        laylaInput?.stop()
-        val timestamp = audioRecorder?.stoppedAtMillis ?: System.currentTimeMillis()
-        val outputFile = laylaInput?.outputFile ?: audioRecorder?.outputFile
-        if (outputFile != null) {
-            val uri = outputFile.absolutePath.let { "file://$it" }
-            sendEvent(
-                "audioend",
-                mapOf(
-                    "uri" to uri,
-                    "timestamp" to timestamp,
-                ),
-            )
-        } else {
-            sendEvent(
-                "audioend",
-                mapOf(
-                    "uri" to null,
-                    "timestamp" to timestamp,
-                ),
-            )
-        }
+        val recorder = audioRecorder
+        val input = laylaInput
         audioRecorder = null
         laylaInput = null
+        val timestamp = recorder?.stoppedAtMillis ?: System.currentTimeMillis()
+        if (input == null) {
+            sendAudioEnd(recorder?.outputFile, timestamp)
+            onStopped()
+            return
+        }
+        recordingClosing = true
+        var done = false
+        val finish = { file: File? ->
+            if (!done) {
+                done = true
+                sendAudioEnd(file, timestamp)
+                onStopped()
+                recordingClosing = false
+                // One at a time: a deferred teardown can start finishing another recording.
+                while (!recordingClosing && afterRecording.isNotEmpty()) afterRecording.removeAt(0)()
+            }
+        }
+        input.close(keepRecording = true) { file -> mainHandler.post { finish(file) } }
+        // Draining is bounded by the two-second capture queue; never leave the session stuck.
+        mainHandler.postDelayed({
+            if (!done) log("Recording did not finish in time; ending without it.")
+            finish(null)
+        }, 5000)
+    }
+
+    private fun sendAudioEnd(file: File?, timestamp: Long) {
+        sendEvent(
+            "audioend",
+            mapOf(
+                "uri" to file?.absolutePath?.let { "file://$it" },
+                "timestamp" to timestamp,
+            ),
+        )
+    }
+
+    /** Runs [action] now, or once the recording being finished has sent its audioend and end. */
+    private fun afterRecordingClosed(action: () -> Unit) {
+        if (recordingClosing) afterRecording.add(action) else action()
     }
 
     /**
@@ -269,19 +300,23 @@ class ExpoSpeechService(
         recognitionState = RecognitionState.STOPPING
         mainHandler.post {
             if (command != commandID.get()) return@post
-            try {
-                speech?.cancel()
-            } catch (e: Exception) {
-                // do nothing
+            // A second teardown (stop after an error, say) must not overtake the first's audioend.
+            afterRecordingClosed {
+                try {
+                    speech?.cancel()
+                } catch (e: Exception) {
+                    // do nothing
+                }
+                speech?.destroy()
+                speech = null
+                soundState = SoundState.INACTIVE
+                delayedFileStreamer?.close()
+                delayedFileStreamer = null
+                stopRecording {
+                    sendEvent("end", null)
+                    recognitionState = state
+                }
             }
-            speech?.destroy()
-            speech = null
-            stopRecording()
-            soundState = SoundState.INACTIVE
-            sendEvent("end", null)
-            recognitionState = state
-            delayedFileStreamer?.close()
-            delayedFileStreamer = null
         }
     }
 

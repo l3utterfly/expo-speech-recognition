@@ -26,9 +26,9 @@ the Silero model is absent, but VAD interruption requires that model.
 - **Android 13+**: converts PCM to signed 16-bit little-endian on a worker and supplies
   a pipe through `RecognizerIntent.EXTRA_AUDIO_SOURCE`. Continuous recognition uses
   `EXTRA_SEGMENTED_SESSION` with that source. Capture offers a bounded queue without
-  blocking the shared mic. Stop unsubscribes and closes the writer after draining;
-  abort releases the pipe immediately. A stalled reader produces `audio-capture`
-  rather than blocking capture. These extras depend on the selected recognition
+  blocking the shared mic. Stop unsubscribes and closes the writer after draining.
+  A stalled reader while listening produces `audio-capture` rather than blocking
+  capture; after stop, a reader that stops reading only ends its own feed. These extras depend on the selected recognition
   service: a service can ignore the supplied source and open its own mic before
   the pipe stalls. Validate every supported service/device; API level alone is
   not proof of echo-safe recognition. There is no automatic fallback to the system
@@ -60,6 +60,17 @@ the audio pipe or segmentation are rejected. `iosCategory` and
 when using the shared mic. Optional recording persists shared PCM as WAV (Android
 16 kHz PCM16; iOS 16 kHz float32). iOS rejects different recording encodings/rates.
 
+A recording's `audioend` carries its `uri` only once the WAV is complete, and it ends
+where capture did: every frame captured before stop or abort is in the file. Each
+frame is written to the file before it reaches the recognizer, so a recognizer that
+stalls or closes its input never costs the recording. On Android the drain and header
+run off the main thread; the session's `audioend` and `end`, and any `start` or stop
+issued meanwhile, wait for them. A recording that cannot be finished within five
+seconds (it never should: the queue holds two) ends the session with a `null` uri.
+A failed disk write also reports `null` rather than a partial file. A start that
+replaces a running session discards that session's recording, as it sends no `audioend`.
+On iOS the file is written and closed on the session queue before `audioend`.
+
 ## Validation
 
 From Layla's existing Android project:
@@ -68,7 +79,8 @@ From Layla's existing Android project:
 .\gradlew.bat :expo-speech-recognition:testDebugUnitTest
 ```
 
-This compiles the integration and tests PCM clipping/encoding and stale callbacks.
+This compiles the integration and tests PCM clipping/encoding, stale callbacks, and
+that a recording keeps every captured frame however the recognizer stops reading.
 App Jest tests cover shared-source selection, continuous result delivery, permissions,
 explicit stop, and call/VAD lifetimes. Pure Swift utterance tests can run on a Swift host:
 
@@ -87,7 +99,8 @@ Before release, rebuild the native app (and install updated pods on macOS), then
 3. Rapid start/stop/start, abort, locale changes, denied permissions, network failure,
    app backgrounding, calls/interruptions, and Bluetooth route changes. Confirm stop
    releases the recognition consumer and no old results arrive in a replacement session.
-4. Recording enabled: verify the emitted WAV exists and has the documented format.
+4. Recording enabled: verify the emitted WAV exists and has the documented format, and
+   that stopping mid-speech keeps the audio up to the stop (its length matches the session).
 
 The implementation was built and unit-tested on Android from Windows. The iOS
 native sources and Swift tests require validation on macOS; no device recognition
