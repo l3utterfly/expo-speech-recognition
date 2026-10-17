@@ -15,8 +15,8 @@ ExpoSpeechRecognitionModule.start({
 
 PCM stays native: one Layla mic produces 16 kHz mono float frames for STT and VAD.
 Recognition does not create its own microphone recorder or reconfigure the iOS
-audio session. `LaylaAudio.startCall(...)` enables call routing and platform echo
-cancellation; TTS and indicator sounds must play through the Layla mixer for that
+audio session. `LaylaAudio.startCall(owner, ...)` takes a call lease that enables call
+routing and platform echo cancellation; TTS and indicator sounds must play through the Layla mixer for that
 cancellation to have the correct output reference. Microphone subscription alone
 does not enable call mode. Layla's `BargeInSession` keeps call mode active even if
 the Silero model is absent, but VAD interruption requires that model.
@@ -47,6 +47,13 @@ the Silero model is absent, but VAD interruption requires that model.
   Native task renewal is still necessary with `SFSpeechRecognizer`; this is not a
   SpeechAnalyzer backend or a guarantee of gapless recognition. Fatal permission,
   service, capture or network errors end the listening session.
+
+  On the shared mic `audiostart` comes when the session subscribes (it names the
+  recording), and `start` with the first frame of audio: layla-audio may still be
+  bringing the device up, or recovering it, when recognition starts, so `start` is the
+  signal that the user can be heard. If layla-audio reports that it cannot recover the
+  microphone (`faulted`), the session ends with an `audio-capture` error rather than
+  listening to nothing.
 
 Start replacement, stop and abort guard queued work and late callbacks so an older
 recognizer cannot end a newer session. `end` represents the end of the listening

@@ -15,6 +15,9 @@ final class LaylaSpeechSession {
   private var options: SpeechRecognitionOptions?
   private var recognizer: SFSpeechRecognizer?
   private var subscription: LaylaAudioSubscription?
+  private var hostListener: LaylaAudioSubscription?
+  /// `start` is sent with the first microphone frame: recognition has begun once audio flows.
+  private var startSent = false
   private var request: SFSpeechAudioBufferRecognitionRequest?
   private var task: SFSpeechRecognitionTask?
   private var active = false
@@ -60,12 +63,21 @@ final class LaylaSpeechSession {
         }
         try prepareRecording(options)
         try beginTask()
+        startSent = false
+        // A host that cannot bring the microphone back would otherwise leave this session
+        // listening to nothing. Async: the host calls listeners on its own queue.
+        hostListener = LaylaAudioEngine.shared.addListener { [weak self] event in
+          guard case .hostState(.faulted, _, _) = event else { return }
+          self?.queue.async { [weak self] in
+            guard let self, self.active, self.sessionID == currentSession else { return }
+            self.fail(LaylaAudioError.device("The microphone stopped delivering audio."))
+          }
+        }
         subscription = try LaylaAudioEngine.shared.addMicConsumer { [weak self] samples, rate in
           self?.offer(samples, rate: rate, session: currentSession)
         }
         audioStarted = true
         emit("audiostart", ["uri": outputURL.map { $0.absoluteString as Any } ?? NSNull(), "timestamp": timestamp()])
-        emit("start", nil)
       } catch {
         fail(error)
       }
@@ -100,6 +112,10 @@ final class LaylaSpeechSession {
     queue.async { [weak self] in
       defer { self?.captureSlots.signal() }
       guard let self, self.active, !self.stopping, self.sessionID == session else { return }
+      if !self.startSent {
+        self.startSent = true
+        self.emit("start", nil)
+      }
       guard rate == 16_000 else {
         self.fail(RecognizerError.invalidAudioSource)
         return
@@ -312,6 +328,8 @@ final class LaylaSpeechSession {
   }
 
   private func stopCapture() {
+    hostListener?.cancel()
+    hostListener = nil
     subscription?.cancel()
     subscription = nil
     if audioEndTimestamp == nil { audioEndTimestamp = timestamp() }
