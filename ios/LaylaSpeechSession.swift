@@ -32,8 +32,6 @@ final class LaylaSpeechSession {
   private var finishTimer: DispatchWorkItem?
   private var pendingFrames: [[Float]] = []
   private var pendingSampleCount = 0
-  private var audioFile: AVAudioFile?
-  private var outputURL: URL?
   private var audioStarted = false
   private var audioEndTimestamp: Double?
   private var lastVolumeTime = Date.distantPast
@@ -61,7 +59,10 @@ final class LaylaSpeechSession {
         if options.requiresOnDeviceRecognition && !recognizer.supportsOnDeviceRecognition {
           throw RecognizerError.recognizerIsUnavailable
         }
-        try prepareRecording(options)
+        // layla-audio records the shared microphone (startRecording); recognition does not.
+        if options.recordingOptions?.persist == true {
+          throw LaylaAudioError.argument("The Layla microphone is recorded by layla-audio (startRecording), not by recognition")
+        }
         try beginTask()
         startSent = false
         // A host that cannot bring the microphone back would otherwise leave this session
@@ -77,7 +78,7 @@ final class LaylaSpeechSession {
           self?.offer(samples, rate: rate, session: currentSession)
         }
         audioStarted = true
-        emit("audiostart", ["uri": outputURL.map { $0.absoluteString as Any } ?? NSNull(), "timestamp": timestamp()])
+        emit("audiostart", ["uri": NSNull(), "timestamp": timestamp()])
       } catch {
         fail(error)
       }
@@ -122,7 +123,6 @@ final class LaylaSpeechSession {
       }
       do {
         let buffer = try self.makeBuffer(samples)
-        try self.audioFile?.write(from: buffer)
         self.reportVolume(samples)
         if self.finishing || self.request == nil {
           // Preserve speech during finalization/renewal, with a fixed five-second limit.
@@ -284,26 +284,6 @@ final class LaylaSpeechSession {
     return buffer
   }
 
-  private func prepareRecording(_ options: SpeechRecognitionOptions) throws {
-    guard let recording = options.recordingOptions, recording.persist else { return }
-    guard recording.outputSampleRate == nil || recording.outputSampleRate == 16_000,
-          recording.outputEncoding == nil || recording.outputEncoding == "pcmFormatFloat32" else {
-      throw RecognizerError.invalidAudioSource
-    }
-    let directory: URL
-    if let path = recording.outputDirectory {
-      if path.hasPrefix("file://") {
-        guard let url = URL(string: path) else { throw RecognizerError.invalidAudioSource }
-        directory = url
-      } else { directory = URL(fileURLWithPath: path, isDirectory: true) }
-    } else { directory = FileManager.default.temporaryDirectory }
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    let url = directory.appendingPathComponent(recording.outputFileName ?? "recording_\(UUID().uuidString).wav")
-    let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
-    audioFile = try AVAudioFile(forWriting: url, settings: format.settings)
-    outputURL = url
-  }
-
   private func reportVolume(_ samples: [Float]) {
     guard options?.volumeChangeEventOptions?.enabled == true, !samples.isEmpty else { return }
     let now = Date()
@@ -347,14 +327,12 @@ final class LaylaSpeechSession {
     task = nil
     request = nil
     stopCapture()
-    audioFile = nil // closes the recorded file before audioend
     pendingFrames.removeAll()
     pendingSampleCount = 0
     if audioStarted {
-      emit("audioend", ["uri": outputURL.map { $0.absoluteString as Any } ?? NSNull(), "timestamp": audioEndTimestamp ?? timestamp()])
+      emit("audioend", ["uri": NSNull(), "timestamp": audioEndTimestamp ?? timestamp()])
     }
     emit("end", nil)
-    outputURL = nil
     audioStarted = false
     audioEndTimestamp = nil
     stopping = false

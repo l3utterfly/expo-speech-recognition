@@ -200,7 +200,8 @@ export type ExpoSpeechRecognitionOptions = {
    * Microphone owner. `layla-audio` consumes native 16 kHz mono frames, sharing
    * capture with VAD and using call-mode echo cancellation during a Layla call.
    * Requires Android 13+ and a recognizer that accepts EXTRA_AUDIO_SOURCE, or iOS.
-   * Cannot be combined with audioSource. iOS continuous sessions renew native
+   * Cannot be combined with audioSource, nor with a persisted recording: record the
+   * shared mic with layla-audio's `startRecording`. iOS continuous sessions renew native
    * recognition tasks without reopening the mic or emitting end between tasks.
    */
   microphoneSource?: "system" | "layla-audio";

@@ -7,27 +7,21 @@ import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import expo.modules.laylaaudio.LaylaAudioEngine
-import java.io.File
 import java.io.IOException
 
-/** Native fan-out consumer. Pipe backpressure never blocks Layla's capture/VAD thread. */
+/**
+ * Native fan-out consumer feeding the recognizer's audio pipe. Pipe backpressure never blocks
+ * Layla's capture/VAD thread. Recordings are layla-audio's (`startRecording`), not this input's.
+ */
 internal class LaylaAudioInput(
     private val context: Context,
-    outputPath: String?,
     onFailure: (Exception) -> Unit,
 ) {
     private val pipe = ParcelFileDescriptor.createPipe()
     val parcel: ParcelFileDescriptor = pipe[0]
     private val writer = pipe[1]
-    private val pump = LaylaRecordingPump(
-        context.cacheDir,
-        outputPath,
-        ::writeFully,
-        { runCatching { writer.close() } },
-        onFailure,
-    )
+    private val pump = LaylaAudioPump(::writeFully, { runCatching { writer.close() } }, onFailure)
     private var subscription: AutoCloseable? = null
-    val outputFileUri: String? = outputPath?.let { "file://$it" }
 
     init {
         // A service may ignore EXTRA_AUDIO_SOURCE entirely. Nonblocking writes
@@ -54,7 +48,7 @@ internal class LaylaAudioInput(
                 }
             }
         } catch (error: Exception) {
-            close(keepRecording = false) {}
+            close()
             throw error
         }
     }
@@ -66,16 +60,11 @@ internal class LaylaAudioInput(
         subscription = null
     }
 
-    /**
-     * Ends capture and the recognizer feed, then finishes the recording off the caller's thread.
-     * [onClosed] gets the complete WAV (null without one, or when [keepRecording] is false).
-     */
-    fun close(keepRecording: Boolean, onClosed: (File?) -> Unit) {
+    /** Ends capture and the recognizer feed now. */
+    fun close() {
         finish()
-        pump.close(keepRecording) { file ->
-            runCatching { parcel.close() }
-            onClosed(file)
-        }
+        pump.close()
+        runCatching { parcel.close() }
     }
 
     private fun writeFully(bytes: ByteArray) {
@@ -90,8 +79,7 @@ internal class LaylaAudioInput(
                 }
             } catch (error: ErrnoException) {
                 if (error.errno != OsConstants.EAGAIN) throw IOException("Speech recognizer audio pipe closed", error)
-                // Once stopped, a recognizer may stop reading for good: give up on it quickly so the
-                // recording is not held back.
+                // Once stopped, a recognizer may stop reading for good: give up on it quickly.
                 val limit = if (pump.stopping) 250 else 2000
                 if (SystemClock.elapsedRealtime() - lastProgress > limit) {
                     throw IOException("Speech recognizer did not read the supplied audio pipe", error)
