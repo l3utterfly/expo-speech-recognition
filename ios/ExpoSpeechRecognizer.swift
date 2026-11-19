@@ -1,5 +1,6 @@
 import AVFoundation
 import Accelerate
+import LaylaAudio
 import Foundation
 import Speech
 import UIKit
@@ -30,6 +31,7 @@ enum RecognizerError: Error {
 }
 
 actor ExpoSpeechRecognizer: ObservableObject {
+  private var trace: AudioTrace?
   private var laylaSession: LaylaSpeechSession?
   private var options: SpeechRecognitionOptions?
   private var audioEngine: AVAudioEngine?
@@ -127,6 +129,7 @@ actor ExpoSpeechRecognizer: ObservableObject {
   // Update the start method signature to include volumeChangeHandler
   @MainActor func start(
     options: SpeechRecognitionOptions,
+    debugTrace: AudioTrace?,
     resultHandler: @escaping (SFSpeechRecognitionResult) -> Void,
     errorHandler: @escaping (Error) -> Void,
     endHandler: (() -> Void)?,
@@ -145,6 +148,7 @@ actor ExpoSpeechRecognizer: ObservableObject {
     self.errorHandler = errorHandler
     await startRecognizer(
       options: options,
+      debugTrace: debugTrace,
       resultHandler: resultHandler,
       errorHandler: errorHandler,
       startHandler: startHandler,
@@ -205,6 +209,7 @@ actor ExpoSpeechRecognizer: ObservableObject {
   /// Creates a `SFSpeechRecognitionTask` that transcribes speech to text until you call `stop()`.
   private func startRecognizer(
     options: SpeechRecognitionOptions,
+    debugTrace: AudioTrace?,
     resultHandler: @escaping (SFSpeechRecognitionResult) -> Void,
     errorHandler: @escaping (Error) -> Void,
     startHandler: @escaping () -> Void,
@@ -222,7 +227,10 @@ actor ExpoSpeechRecognizer: ObservableObject {
     self.outputFileUrl = nil
     self.speechStartHandler = speechStartHandler
 
+    trace = debugTrace
+    if options.microphoneSource == "layla-audio" { trace?.observeMicrophone() }
     guard let recognizer, recognizer.isAvailable else {
+      trace?.event("recognizer unavailable")
       errorHandler(RecognizerError.recognizerIsUnavailable)
       reset(andEmitEnd: true)
       return
@@ -233,7 +241,8 @@ actor ExpoSpeechRecognizer: ObservableObject {
         throw RecognizerError.invalidAudioSource
       }
       if options.microphoneSource == "layla-audio" {
-        let session = LaylaSpeechSession(emit: laylaEventHandler)
+        let session = LaylaSpeechSession(trace: trace, emit: laylaEventHandler)
+        trace = nil // the continuous session owns its lifetime across Apple task renewals
         laylaSession = session
         session.start(options: options, recognizer: recognizer)
         return
@@ -269,6 +278,7 @@ actor ExpoSpeechRecognizer: ObservableObject {
       // If user has opted in to recording, emit an "audiostart" event with the path
       audioStartHandler(outputFileUrl?.absoluteString, audioStartTimestampMillis)
     } catch {
+      trace?.event("start failed: \(error)")
       errorHandler(error)
       reset(andEmitEnd: true)
     }
@@ -288,7 +298,9 @@ actor ExpoSpeechRecognizer: ObservableObject {
 
     self.task = recognizer.recognitionTask(
       with: request,
-      resultHandler: { [weak self] result, error in
+      resultHandler: { [weak self, trace] result, error in
+        if let result { trace?.event("Apple final=\(result.isFinal) text=\(result.bestTranscription.formattedString)") }
+        if let error { trace?.event("Apple error=\(error)") }
         self?.recognitionHandler(
           audioEngine: audioEngine,
           result: result,
@@ -408,6 +420,7 @@ actor ExpoSpeechRecognizer: ObservableObject {
       options: options,
       request: request,
       audioFileRef: self.audioFileRef,
+      trace: trace,
       volumeChangeHandler: { volume in
         Task { @MainActor in
           self.volumeChangeHandler?(volume)
@@ -585,7 +598,8 @@ actor ExpoSpeechRecognizer: ObservableObject {
     // This avoids emitting the end handler multiple times
     // Unless we really need to emit the end event
     // (e.g. in the case of a setup error)
-    print("SpeechRecognizer: end")
+    trace?.close()
+    trace = nil
     if shouldEmitEndEvent {
       Task { @MainActor in
         self.errorHandler = nil
@@ -666,6 +680,7 @@ actor ExpoSpeechRecognizer: ObservableObject {
     options: SpeechRecognitionOptions,
     request: SFSpeechRecognitionRequest,
     audioFileRef: ExtAudioFileRef?,
+    trace: AudioTrace?,
     volumeChangeHandler: ((Float) -> Void)?
   ) throws {
     guard let audioBufferRequest = request as? SFSpeechAudioBufferRecognitionRequest else {
@@ -696,6 +711,9 @@ actor ExpoSpeechRecognizer: ObservableObject {
       format: audioFormat
     ) {
       (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
+      if let trace, let data = buffer.floatChannelData?[0] {
+        trace.samples(data, count: Int(buffer.frameLength), rate: Int(buffer.format.sampleRate))
+      }
       audioBufferRequest.append(buffer)
 
       // Feature: Record to a file
@@ -840,6 +858,7 @@ actor ExpoSpeechRecognizer: ObservableObject {
         options: options,
         request: request,
         audioFileRef: self.audioFileRef,
+        trace: trace,
         volumeChangeHandler: { volume in
           Task { @MainActor in
             self.volumeChangeHandler?(volume)

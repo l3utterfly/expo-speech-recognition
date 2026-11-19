@@ -8,6 +8,8 @@ import expo.modules.kotlin.types.OptimizedRecord
 
 @OptimizedRecord
 class SpeechRecognitionOptions : Record {
+    @Field val debug: Boolean = false
+
     @Field
     val microphoneSource: String = "system"
 

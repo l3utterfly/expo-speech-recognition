@@ -2,6 +2,8 @@ import ExpoModulesCore
 import Speech
 
 struct SpeechRecognitionOptions: Record {
+  @Field var debug: Bool = false
+
   @Field
   var microphoneSource: String = "system"
 

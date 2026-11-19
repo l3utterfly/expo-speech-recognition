@@ -1,5 +1,6 @@
 import AVFoundation
 import ExpoModulesCore
+import LaylaAudio
 import Speech
 
 struct Segment {
@@ -196,7 +197,12 @@ public class ExpoSpeechRecognitionModule: Module {
     Function("start") { (options: SpeechRecognitionOptions) in
       let command = nextCommand()
       Task {
+        var trace: AudioTrace?
         do {
+          guard isCurrentCommand(command) else { return }
+          if options.debug {
+            trace = try AudioTrace(source: "ios native source=\(options.microphoneSource) lang=\(options.lang)", sharedMic: false)
+          }
           let currentLocale = await speechRecognizer?.getLocale()
           guard isCurrentCommand(command) else { return }
 
@@ -206,6 +212,7 @@ public class ExpoSpeechRecognitionModule: Module {
           // Re-create the speech recognizer when locales change
           if self.speechRecognizer == nil || currentLocale != options.lang {
             guard let locale = resolveLocale(localeIdentifier: options.lang) else {
+              trace?.event("unsupported locale=\(options.lang)")
               let availableLocales = SFSpeechRecognizer.supportedLocales().map { $0.identifier }
                 .joined(separator: ", ")
 
@@ -230,6 +237,7 @@ public class ExpoSpeechRecognitionModule: Module {
             let authorized = await SFSpeechRecognizer.hasAuthorizationToRecognize()
             guard isCurrentCommand(command) else { return }
             guard authorized else {
+              trace?.event("speech recognition permission denied")
               sendErrorAndStop(
                 error: "not-allowed",
                 message: RecognizerError.notAuthorizedToRecognize.message
@@ -243,6 +251,7 @@ public class ExpoSpeechRecognitionModule: Module {
           let permitted = await AVAudioSession.sharedInstance().hasPermissionToRecord()
           guard isCurrentCommand(command) else { return }
           guard permitted else {
+            trace?.event("microphone permission denied")
             sendErrorAndStop(
               error: "not-allowed",
               message: RecognizerError.notPermittedToRecord.message
@@ -254,6 +263,7 @@ public class ExpoSpeechRecognitionModule: Module {
           // Start recognition!
           await speechRecognizer?.start(
             options: options,
+            debugTrace: trace,
             resultHandler: { [weak self] result in
               self?.handleRecognitionResult(result, maxAlternatives: options.maxAlternatives)
             },
@@ -296,6 +306,7 @@ public class ExpoSpeechRecognitionModule: Module {
             }
           )
         } catch {
+          trace?.event("start failed: \(error)")
           guard isCurrentCommand(command) else { return }
           self.sendEvent(
             "error",

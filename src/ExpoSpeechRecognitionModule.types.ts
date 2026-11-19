@@ -205,6 +205,8 @@ export type ExpoSpeechRecognitionOptions = {
    * recognition tasks without reopening the mic or emitting end between tasks.
    */
   microphoneSource?: "system" | "layla-audio";
+  /** Write diagnostics for this recognition session to the app cache. */
+  debug?: boolean;
   /** [Default: "en-US"] The language of the speech recognition */
   lang?: string;
   /** [Default: false] Emit partial results. The Layla microphone also emits utterance finals while continuously listening. */

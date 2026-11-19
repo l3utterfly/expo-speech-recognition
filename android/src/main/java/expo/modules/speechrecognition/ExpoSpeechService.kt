@@ -15,7 +15,7 @@ import android.speech.RecognitionPart
 import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import android.util.Log
+import expo.modules.laylaaudio.AudioTrace
 import java.io.File
 import java.net.URI
 import java.util.Locale
@@ -81,7 +81,6 @@ class ExpoSpeechService(
 
             for (service in services) {
                 if (service.serviceInfo.packageName == packageName) {
-                    Log.d("ExpoSpeechService", "Found service for package $packageName: ${service.serviceInfo.name}")
                     return ComponentName(service.serviceInfo.packageName, service.serviceInfo.name)
                 }
             }
@@ -90,9 +89,8 @@ class ExpoSpeechService(
         }
     }
 
-    private fun log(message: String) {
-        Log.d("ExpoSpeechService", message)
-    }
+    private var trace: AudioTrace? = null
+    private var lastDebugLevelMs = 0L
 
     private fun createSpeechRecognizer(options: SpeechRecognitionOptions): SpeechRecognizer? {
         val value =
@@ -118,14 +116,15 @@ class ExpoSpeechService(
     }
 
     /** Starts speech recognition */
-    fun start(options: SpeechRecognitionOptions) {
+    fun start(options: SpeechRecognitionOptions) = startSession(options, renewing = false)
+
+    private fun startSession(options: SpeechRecognitionOptions, renewing: Boolean) {
         val command = commandID.incrementAndGet()
         val session = sessionID.incrementAndGet()
         mainHandler.post {
             if (command != commandID.get()) return@post
             this.options = options
             activeSessionID = session
-            log("Start recognition.")
 
             // Destroy any previous SpeechRecognizer / audio recorder
             speech?.destroy()
@@ -141,6 +140,25 @@ class ExpoSpeechService(
             soundState = SoundState.INACTIVE
             lastVolumeChangeEventTime = 0L
             try {
+                if (!renewing) {
+                    trace?.close()
+                    trace = null
+                    if (options.debug) {
+                        val service = when {
+                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && options.requiresOnDeviceRecognition == true -> "on-device"
+                            options.androidRecognitionServicePackage != null -> options.androidRecognitionServicePackage
+                            else -> runCatching {
+                                android.provider.Settings.Secure.getString(reactContext.contentResolver, "voice_recognition_service")
+                            }.getOrNull() ?: "default"
+                        }
+                        trace = AudioTrace(
+                            reactContext,
+                            "android native source=${options.microphoneSource} lang=${options.lang} service=$service",
+                            options.microphoneSource == "layla-audio",
+                        )
+                        lastDebugLevelMs = 0
+                    }
+                } else trace?.event("renew legacy recognizer")
                 val intent = createSpeechIntent(options)
                 speech = createSpeechRecognizer(options)
 
@@ -173,8 +191,7 @@ class ExpoSpeechService(
                         e.message != null -> e.message
                         else -> "Unknown error"
                     }
-                e.printStackTrace()
-                log("Failed to create Speech Recognizer with error: $errorMessage")
+                trace?.event("Failed to create Speech Recognizer with error: $errorMessage")
                 sendEvent("error", mapOf("error" to "audio-capture", "message" to errorMessage, "code" to -1))
                 teardownAndEnd()
             }
@@ -278,6 +295,8 @@ class ExpoSpeechService(
             speech?.destroy()
             speech = null
             stopRecording()
+            trace?.close()
+            trace = null
             soundState = SoundState.INACTIVE
             sendEvent("end", null)
             recognitionState = state
@@ -327,9 +346,10 @@ class ExpoSpeechService(
         // Set up audio recording & sink to recognizer/file
         if (options.microphoneSource == "layla-audio") {
             lateinit var input: LaylaAudioInput
-            input = LaylaAudioInput(reactContext) { error ->
+            input = LaylaAudioInput(reactContext, trace) { error ->
                 mainHandler.post {
                     if (laylaInput === input && recognitionState != RecognitionState.STOPPING) {
+                        trace?.event("pipe error=${error.message}")
                         sendEvent("error", mapOf("error" to "audio-capture", "message" to error.message, "code" to -1))
                         teardownAndEnd(RecognitionState.ERROR)
                     }
@@ -386,7 +406,7 @@ class ExpoSpeechService(
             intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 600000)
             intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 600000)
             intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 600000)
-            log("Continuous transcription opted in (older platforms)")
+            trace?.event("Continuous transcription opted in (older platforms)")
         }
 
         // Feature: Transcribe audio from a local or remote file
@@ -395,7 +415,7 @@ class ExpoSpeechService(
                 throw Exception("Audio source is only supported on Android 13 and above")
             }
 
-            log("Transcribing audio from local file: ${options.audioSource.uri}")
+            trace?.event("Transcribing audio from local file: ${options.audioSource.uri}")
             val file = resolveSourceUri(options.audioSource.uri)
 
             // The file should exist, otherwise throw an error
@@ -443,7 +463,7 @@ class ExpoSpeechService(
             // Optional list of strings, towards which the recognizer should bias the recognition results.
             // These are separate from the device context.
             val strings = ArrayList(contextualStrings)
-            log("biasing strings: ${strings.joinToString(", ")}")
+            trace?.event("biasing strings: ${strings.joinToString(", ")}")
             intent.putExtra(
                 RecognizerIntent.EXTRA_BIASING_STRINGS,
                 // List<String> -> ArrayList<java.lang.String>
@@ -468,7 +488,7 @@ class ExpoSpeechService(
         val language = options.lang.takeIf { it.isNotEmpty() } ?: Locale.getDefault().toString()
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
 
-        log("androidIntentOptions: ${options.androidIntentOptions}")
+        trace?.event("androidIntentOptions: ${options.androidIntentOptions}")
 
         // Add any additional intent extras provided by the user
         options.androidIntentOptions?.forEach { (key, value) ->
@@ -477,7 +497,7 @@ class ExpoSpeechService(
             val field = RecognizerIntent::class.java.getDeclaredField(key)
             val fieldValue = field.get(null) as? String
 
-            log("Resolved key $key -> $fieldValue with value: $value (${value.javaClass.name})")
+            trace?.event("Resolved key $key -> $fieldValue with value: $value (${value.javaClass.name})")
             when (value) {
                 is Boolean -> intent.putExtra(fieldValue, value)
                 is Int -> intent.putExtra(fieldValue, value)
@@ -533,6 +553,7 @@ class ExpoSpeechService(
         }
 
     override fun onReadyForSpeech(params: Bundle?) {
+        trace?.event("provider ready")
         // Avoid sending this event if there was an error
         // An error may preempt this event in the case of a permission error or a language not supported error
         if (recognitionState == RecognitionState.STARTING) {
@@ -542,10 +563,18 @@ class ExpoSpeechService(
     }
 
     override fun onBeginningOfSpeech() {
+        trace?.event("provider speech start")
         sendEvent("speechstart", null)
     }
 
     override fun onRmsChanged(rmsdB: Float) {
+        trace?.let {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastDebugLevelMs >= 1000) {
+                lastDebugLevelMs = now
+                it.event("provider rmsDb=$rmsdB")
+            }
+        }
         if (options.volumeChangeEventOptions?.enabled != true) {
             return
         }
@@ -572,7 +601,7 @@ class ExpoSpeechService(
         if (!isSilent && soundState != SoundState.ACTIVE) {
             sendEvent("soundstart", null)
             soundState = SoundState.ACTIVE
-            log("Changed sound state to ACTIVE")
+            trace?.event("Changed sound state to ACTIVE")
             return
         }
 
@@ -580,7 +609,7 @@ class ExpoSpeechService(
         if (isSilent && soundState == SoundState.ACTIVE && (System.currentTimeMillis() - lastTimeSoundDetected) > 150) {
             sendEvent("soundend", null)
             soundState = SoundState.SILENT
-            log("Changed sound state to SILENT")
+            trace?.event("Changed sound state to SILENT")
         }
          */
     }
@@ -592,10 +621,11 @@ class ExpoSpeechService(
     override fun onEndOfSpeech() {
         // recognitionState = RecognitionState.INACTIVE
         sendEvent("speechend", null)
-        log("onEndOfSpeech()")
+        trace?.event("onEndOfSpeech()")
     }
 
     override fun onError(error: Int) {
+        trace?.event("provider error code=$error")
         if ((error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) &&
             renewLegacyContinuous()
         ) return
@@ -608,7 +638,7 @@ class ExpoSpeechService(
 
         sendEvent("error", mapOf("error" to errorInfo.error, "message" to errorInfo.message, "code" to error))
         teardownAndEnd(RecognitionState.ERROR)
-        log("onError() - ${errorInfo.error}: ${errorInfo.message} - code: $error")
+        trace?.event("onError() - ${errorInfo.error}: ${errorInfo.message} - code: $error")
     }
 
     private fun getResults(results: Bundle?): List<Map<String, Any>> {
@@ -697,7 +727,7 @@ class ExpoSpeechService(
                 ),
             )
         }
-        log("onResults(), results: $resultsList")
+        trace?.event("provider final text=${resultsList.firstOrNull()?.get("transcript") ?: ""}")
 
         if (!renewLegacyContinuous()) teardownAndEnd()
     }
@@ -715,7 +745,7 @@ class ExpoSpeechService(
         speech = null
         recognitionState = RecognitionState.STARTING
         mainHandler.postDelayed({
-            if (command == commandID.get() && session == sessionID.get()) start(options)
+            if (command == commandID.get() && session == sessionID.get()) startSession(options, renewing = true)
         }, 250)
         return true
     }
@@ -725,7 +755,7 @@ class ExpoSpeechService(
         // Avoid sending result event if there was an empty result, or the first result is an empty string
         val nonEmptyStrings = partialResultsList.filter { it["transcript"]?.toString()?.isNotEmpty() ?: false }
 
-        log("onPartialResults(), results: $nonEmptyStrings")
+        trace?.event("provider partial text=${nonEmptyStrings.firstOrNull()?.get("transcript") ?: ""}")
         if (nonEmptyStrings.isNotEmpty()) {
             sendEvent("result", mapOf("results" to nonEmptyStrings, "isFinal" to false))
         }
@@ -767,7 +797,7 @@ class ExpoSpeechService(
                 ),
             )
         }
-        log("onSegmentResults(), transcriptions: $resultsList")
+        trace?.event("provider segment final text=${resultsList.firstOrNull()?.get("transcript") ?: ""}")
 
         // If the user opted to stop
         if (recognitionState == RecognitionState.STOPPING) {
@@ -776,7 +806,7 @@ class ExpoSpeechService(
     }
 
     override fun onEndOfSegmentedSession() {
-        log("onEndOfSegmentedSession()")
+        trace?.event("onEndOfSegmentedSession()")
         teardownAndEnd()
     }
 

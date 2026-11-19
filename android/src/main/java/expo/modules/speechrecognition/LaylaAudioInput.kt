@@ -15,11 +15,14 @@ import java.io.IOException
  */
 internal class LaylaAudioInput(
     private val context: Context,
+    private val trace: expo.modules.laylaaudio.AudioTrace?,
     onFailure: (Exception) -> Unit,
 ) {
     private val pipe = ParcelFileDescriptor.createPipe()
     val parcel: ParcelFileDescriptor = pipe[0]
     private val writer = pipe[1]
+    private val bytesWritten = if (trace != null) java.util.concurrent.atomic.AtomicLong() else null
+    private val framesOffered = if (trace != null) java.util.concurrent.atomic.AtomicLong() else null
     private val pump = LaylaAudioPump(::writeFully, { runCatching { writer.close() } }, onFailure)
     private var subscription: AutoCloseable? = null
 
@@ -41,6 +44,7 @@ internal class LaylaAudioInput(
         pump.start()
         try {
             subscription = LaylaAudioEngine.addMicConsumer { samples, rate ->
+                framesOffered?.incrementAndGet()
                 if (rate != 16000) {
                     pump.fail(IOException("Layla microphone audio is not 16 kHz"))
                 } else if (!pump.offer(samples)) {
@@ -64,6 +68,7 @@ internal class LaylaAudioInput(
     fun close() {
         finish()
         pump.close()
+        trace?.event("pipe closed offeredFrames=${framesOffered?.get()} bytesWritten=${bytesWritten?.get()}")
         runCatching { parcel.close() }
     }
 
@@ -74,6 +79,11 @@ internal class LaylaAudioInput(
             try {
                 val written = Os.write(writer.fileDescriptor, bytes, offset, bytes.size - offset)
                 if (written > 0) {
+                    bytesWritten?.let { counter ->
+                        val total = counter.addAndGet(written.toLong())
+                        if (total == written.toLong() || total / 32000 != (total - written) / 32000)
+                            trace?.event("pipe offeredFrames=${framesOffered?.get()} bytesWritten=$total")
+                    }
                     offset += written
                     lastProgress = SystemClock.elapsedRealtime()
                 }

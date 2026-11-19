@@ -36,7 +36,10 @@ final class LaylaSpeechSession {
   private var audioEndTimestamp: Double?
   private var lastVolumeTime = Date.distantPast
 
-  init(emit: @escaping (String, [String: Any]?) -> Void) { self.emit = emit }
+  private let trace: AudioTrace?
+  private var appendedSamples = 0
+
+  init(trace: AudioTrace? = nil, emit: @escaping (String, [String: Any]?) -> Void) { self.trace = trace; self.emit = emit }
 
   func getState() -> String {
     queue.sync { active ? (stopping ? "stopping" : "recognizing") : "inactive" }
@@ -133,8 +136,17 @@ final class LaylaSpeechSession {
           self.pendingSampleCount += samples.count
         } else {
           self.request?.append(buffer)
+          if self.trace != nil { self.countAppend(samples.count) }
         }
       } catch { self.fail(error) }
+    }
+  }
+
+  private func countAppend(_ count: Int) {
+    let previous = appendedSamples
+    appendedSamples += count
+    if previous == 0 || previous / 16000 != appendedSamples / 16000 {
+      trace?.event("Apple appendedSamples=\(appendedSamples)")
     }
   }
 
@@ -143,6 +155,7 @@ final class LaylaSpeechSession {
       throw RecognizerError.recognizerIsUnavailable
     }
     taskID += 1
+    trace?.event("Apple task=\(taskID) bufferedSamples=\(pendingSampleCount)")
     let currentTask = taskID
     let newRequest = SFSpeechAudioBufferRecognitionRequest()
     newRequest.shouldReportPartialResults = true // native utterance endpointing needs partials
@@ -161,6 +174,7 @@ final class LaylaSpeechSession {
       }
     }
     for samples in pendingFrames { newRequest.append(try makeBuffer(samples)) }
+    if trace != nil && pendingSampleCount > 0 { countAppend(pendingSampleCount) }
     pendingFrames.removeAll(keepingCapacity: true)
     pendingSampleCount = 0
     let renewal = DispatchWorkItem { [weak self] in
@@ -197,6 +211,7 @@ final class LaylaSpeechSession {
     if result?.isFinal == true {
       completeTask()
     } else if let error {
+      trace?.event("Apple callback error=\(error)")
       let native = error as NSError
       let noSpeech = native.domain == "kAFAssistantErrorDomain" && native.code == 1110
       let cancelled = native.domain == "kLSRErrorDomain" && native.code == 301
@@ -260,6 +275,7 @@ final class LaylaSpeechSession {
   }
 
   private func emitResult(_ result: SFSpeechRecognitionResult, final: Bool) {
+    trace?.event("Apple task=\(taskID) final=\(final) text=\(result.bestTranscription.formattedString)")
     let alternatives = result.transcriptions.prefix(max(1, options?.maxAlternatives ?? 1)).map { transcription in
       let segments = transcription.segments.map { segment in
         Segment(startTimeMillis: segment.timestamp * 1000,
@@ -295,6 +311,7 @@ final class LaylaSpeechSession {
   }
 
   private func fail(_ error: Error) {
+    trace?.event("recognition failed: \(error)")
     let code: String
     if let recognition = error as? RecognizerError {
       code = recognition == .recognizerIsUnavailable ? "service-not-allowed" : "audio-capture"
@@ -327,6 +344,8 @@ final class LaylaSpeechSession {
     task = nil
     request = nil
     stopCapture()
+    trace?.event("Apple end appendedSamples=\(appendedSamples) bufferedSamples=\(pendingSampleCount)")
+    trace?.close()
     pendingFrames.removeAll()
     pendingSampleCount = 0
     if audioStarted {

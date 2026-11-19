@@ -205,6 +205,10 @@ class ExpoSpeechRecognitionModule : Module() {
             /** Start recognition with args: lang, interimResults, maxAlternatives */
             Function("start") { options: SpeechRecognitionOptions ->
                 if (hasNotGrantedRecordPermissions()) {
+                    if (options.debug) {
+                        expo.modules.laylaaudio.AudioTrace(requireNotNull(appContext.reactContext), "android native source=${options.microphoneSource}", false)
+                            .use { it.event("RECORD_AUDIO permission denied") }
+                    }
                     sendEvent("error", mapOf("error" to "not-allowed", "message" to "Missing RECORD_AUDIO permissions.", "code" to -1))
                     sendEvent("end")
                     return@Function
